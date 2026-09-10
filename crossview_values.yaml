@@ -242,8 +242,8 @@ config:
 secrets:
   adminUsername: "admin"
   adminPassword: "password"
-  dbPassword: ""
-  sessionSecret: ""
+  dbPassword: "crossview-db-pass"
+  sessionSecret: "change-me-to-a-long-random-string"
   OIDCClientSecret: ""
   SAMLCert: ""
 
