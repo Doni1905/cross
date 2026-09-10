@@ -128,8 +128,11 @@ gatewayAPI:
               value: /
 
 # Database configuration
+# Bundled in-cluster Postgres is DISABLED: CrossView uses an external AWS RDS
+# instance instead (see config.database below). Leaving this true would deploy a
+# postgres:latest pod + 10Gi PVC that we do not want.
 database:
-  enabled: true
+  enabled: false
   image:
     repository: postgres
     tag: "latest"
@@ -165,12 +168,21 @@ config:
   ref: ""
   database:
     enabled: true
-    host: ""
+    # External AWS RDS (PostgreSQL) endpoint. REPLACE with the real RDS writer
+    # endpoint once the instance exists (created as a Crossplane claim in
+    # tpc-crossplane-iac). Format: <db-identifier>.<hash>.us-east-1.rds.amazonaws.com
+    host: "xplane-rds-cluster-01-cluster.cluster-cdzpb0fqqnyt.us-east-1.rds.amazonaws.com"
     port: 5432
     database: crossview
-    username: postgres
+    # DB login role on RDS. This is the Postgres role CrossView authenticates as.
+    # Dedicated least-privilege app role (owns the crossview DB); NOT the RDS
+    # master user. Its password lives in Secrets Manager prod/devops-eks/crossview
+    # under db-password (synced via the ExternalSecret below).
+    username: crossview
     ssl:
-        mode: disable
+        # RDS enforces TLS in this platform; verify against the AWS global CA
+        # bundle (see the nexus rds-ca-bundle pattern for mounting global-bundle.pem).
+        mode: require
         rootCert: ""
         cert: ""
         key: ""
@@ -241,9 +253,25 @@ config:
 # - Object with secretKeyRef: references an existing secret (no creation)
 secrets:
   adminUsername: "admin"
-  adminPassword: "password"
-  dbPassword: "crossview-db-pass"
-  sessionSecret: "change-me-to-a-long-random-string"
+  # Admin password is fetched from AWS Secrets Manager (via the ExternalSecret in
+  # extraManifests below) into the k8s secret `prod-crossview-secrets`, same as
+  # dbPassword. Never commit a plaintext admin password.
+  adminPassword:
+    secretKeyRef:
+      name: prod-crossview-secrets
+      key: admin-password
+  # RDS password is fetched from AWS Secrets Manager (via the ExternalSecret in
+  # extraManifests below) into the k8s secret `prod-crossview-secrets`. Pod Identity
+  # is only the pipeline that lets ESO read Secrets Manager; CrossView receives a
+  # plain password string, so no RDS IAM token handling is needed.
+  # NOTE: the secret MUST exist before the pod starts, or the pod blocks on
+  # CreateContainerConfigError. The sync-wave annotation on the ExternalSecret
+  # orders its creation ahead of the Deployment.
+  dbPassword:
+    secretKeyRef:
+      name: prod-crossview-secrets
+      key: db-password
+  sessionSecret: ""
   OIDCClientSecret: ""
   SAMLCert: ""
 
@@ -307,4 +335,35 @@ autoscaling:
   maxReplicas: 10
 
 # Extra manifests
-extraManifests: []
+# ExternalSecret that syncs the RDS password from AWS Secrets Manager into the
+# k8s secret `prod-crossview-secrets`, referenced by secrets.dbPassword above.
+# Mirrors the twingate-connector ExternalSecret pattern (ClusterSecretStore
+# `aws-cluster-secretstore`). The sync-wave "-1" makes ArgoCD create this (and thus
+# ESO create the secret) before the CrossView Deployment (default wave 0), avoiding
+# CreateContainerConfigError on first sync.
+# REPLACE remoteRef.key with the actual Secrets Manager secret path once created.
+extraManifests:
+  - apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: prod-crossview-secrets
+      namespace: crossview
+      annotations:
+        argocd.argoproj.io/sync-wave: "-1"
+    spec:
+      refreshInterval: 1h
+      secretStoreRef:
+        name: aws-cluster-secretstore
+        kind: ClusterSecretStore
+      target:
+        name: prod-crossview-secrets
+        creationPolicy: Owner
+      data:
+        - secretKey: db-password
+          remoteRef:
+            key: prod/devops/crossview
+            property: db-password
+        - secretKey: admin-password
+          remoteRef:
+            key: prod/devops/crossview
+            property: admin-password
