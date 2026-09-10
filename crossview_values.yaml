@@ -176,7 +176,7 @@ config:
     database: crossview
     # DB login role on RDS. This is the Postgres role CrossView authenticates as.
     # Dedicated least-privilege app role (owns the crossview DB); NOT the RDS
-    # master user. Its password lives in Secrets Manager prod/devops-eks/crossview
+    # master user. Its password lives in Secrets Manager prod/devops/crossview
     # under db-password (synced via the ExternalSecret below).
     username: crossview
     ssl:
@@ -341,9 +341,12 @@ autoscaling:
 # `aws-cluster-secretstore`). The sync-wave "-1" makes ArgoCD create this (and thus
 # ESO create the secret) before the CrossView Deployment (default wave 0), avoiding
 # CreateContainerConfigError on first sync.
-# REPLACE remoteRef.key with the actual Secrets Manager secret path once created.
+# remoteRef.key is the Secrets Manager secret path: prod/devops/crossview
+# (holds db-password and admin-password). extraManifests items must be YAML
+# strings (see chart values.schema.json), hence the "|-" block below.
 extraManifests:
-  - apiVersion: external-secrets.io/v1
+  - |-
+    apiVersion: external-secrets.io/v1
     kind: ExternalSecret
     metadata:
       name: prod-crossview-secrets
