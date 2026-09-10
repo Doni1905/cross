@@ -20,7 +20,16 @@ app:
   port: 3001
   replicas: 1
   automountServiceAccountToken: null
-  extraEnv: []
+  # DB_HOST is injected from the k8s secret prod-crossview-secrets (key: host)
+  # instead of config.database.host, which the chart only accepts as a plain
+  # string. The chart appends app.extraEnv AFTER the ConfigMap-sourced env vars,
+  # so this DB_HOST overrides the (empty) ConfigMap one.
+  extraEnv:
+    - name: DB_HOST
+      valueFrom:
+        secretKeyRef:
+          name: prod-crossview-secrets
+          key: host
   extraVolumes: []
   extraVolumeMounts: []
   extraInitContainers: []
@@ -168,13 +177,14 @@ config:
   ref: ""
   database:
     enabled: true
-    # External AWS RDS (PostgreSQL) endpoint. REPLACE with the real RDS writer
-    # endpoint once the instance exists (created as a Crossplane claim in
-    # tpc-crossplane-iac). Format: <db-identifier>.<hash>.us-east-1.rds.amazonaws.com
-    host: "xplane-rds-cluster-01-cluster.cluster-cdzpb0fqqnyt.us-east-1.rds.amazonaws.com"
+    # External AWS RDS (Aurora PostgreSQL) CLUSTER WRITER endpoint.
+    # Left empty on purpose: DB_HOST is injected from the k8s secret
+    # `prod-crossview-secrets` (key: host) via app.extraEnv below, which the chart
+    # appends AFTER the ConfigMap env so it wins. The secret is populated from
+    # Secrets Manager (property: host) by the ExternalSecret.
+    host: ""
     port: 5432
     database: crossview
-    # DB login role on RDS. This is the Postgres role CrossView authenticates as.
     # Dedicated least-privilege app role (owns the crossview DB); NOT the RDS
     # master user. Its password lives in Secrets Manager prod/devops/crossview
     # under db-password (synced via the ExternalSecret below).
@@ -342,7 +352,7 @@ autoscaling:
 # ESO create the secret) before the CrossView Deployment (default wave 0), avoiding
 # CreateContainerConfigError on first sync.
 # remoteRef.key is the Secrets Manager secret path: prod/devops/crossview
-# (holds db-password and admin-password). extraManifests items must be YAML
+# (holds host, db-password and admin-password). extraManifests items must be YAML
 # strings (see chart values.schema.json), hence the "|-" block below.
 extraManifests:
   - |-
@@ -362,6 +372,10 @@ extraManifests:
         name: prod-crossview-secrets
         creationPolicy: Owner
       data:
+        - secretKey: host
+          remoteRef:
+            key: prod/devops/crossview
+            property: host
         - secretKey: db-password
           remoteRef:
             key: prod/devops/crossview
