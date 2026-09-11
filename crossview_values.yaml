@@ -20,16 +20,12 @@ app:
   port: 3001
   replicas: 1
   automountServiceAccountToken: null
-  # DB_HOST is injected from the k8s secret prod-crossview-secrets (key: host)
-  # instead of config.database.host, which the chart only accepts as a plain
-  # string. The chart appends app.extraEnv AFTER the ConfigMap-sourced env vars,
-  # so this DB_HOST overrides the (empty) ConfigMap one.
-  extraEnv:
-    - name: DB_HOST
-      valueFrom:
-        secretKeyRef:
-          name: prod-crossview-secrets
-          key: host
+  # IMPORTANT: do NOT inject DB_HOST via extraEnv. The chart already renders a
+  # DB_HOST env from the ConfigMap; a second DB_HOST here collides on apply
+  # ("may not have more than one field specified at a time"). The host is synced
+  # into the secret prod-crossview-secrets (key: host) for reference/consistency,
+  # but the app consumes it through config.database.host below.
+  extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []
   extraInitContainers: []
@@ -178,11 +174,13 @@ config:
   database:
     enabled: true
     # External AWS RDS (Aurora PostgreSQL) CLUSTER WRITER endpoint.
-    # Left empty on purpose: DB_HOST is injected from the k8s secret
-    # `prod-crossview-secrets` (key: host) via app.extraEnv below, which the chart
-    # appends AFTER the ConfigMap env so it wins. The secret is populated from
-    # Secrets Manager (property: host) by the ExternalSecret.
-    host: ""
+    # This is what the app actually uses (wired into the crossview-config
+    # ConfigMap -> DB_HOST env). The same value is ALSO synced into the secret
+    # prod-crossview-secrets (key: host) via the ExternalSecret below, so the host
+    # lives in Secrets Manager too. It must NOT be injected as a DB_HOST env, or it
+    # collides with the chart's own DB_HOST. Keep this value in sync with the
+    # `host` property in Secrets Manager (prod/devops/crossview).
+    host: "xplane-rds-cluster-01-cluster.cluster-cdzpb0fqqnyt.us-east-1.rds.amazonaws.com"
     port: 5432
     database: crossview
     # Dedicated least-privilege app role (owns the crossview DB); NOT the RDS
@@ -352,7 +350,9 @@ autoscaling:
 # ESO create the secret) before the CrossView Deployment (default wave 0), avoiding
 # CreateContainerConfigError on first sync.
 # remoteRef.key is the Secrets Manager secret path: prod/devops/crossview
-# (holds host, db-password and admin-password). extraManifests items must be YAML
+# (holds host, db-password and admin-password). The host is synced into the secret
+# for reference, but the app consumes it via config.database.host (NOT as an env,
+# which would collide with the chart's DB_HOST). extraManifests items must be YAML
 # strings (see chart values.schema.json), hence the "|-" block below.
 extraManifests:
   - |-
