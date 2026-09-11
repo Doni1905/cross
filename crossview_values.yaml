@@ -1,4 +1,3 @@
----
 # Default values for crossview
 # This is a YAML-formatted file.
 
@@ -53,8 +52,6 @@ deployment:
       maxUnavailable: 0
 
 # Resource limits and requests
-# Defaults are set for typical clusters. If the pod is OOMKilled when opening the dashboard,
-# increase memory (e.g. 1Gi–2Gi); see docs/TROUBLESHOOTING.md#oomkilled-when-opening-the-dashboard.
 resources:
   requests:
     memory: "256Mi"
@@ -105,27 +102,17 @@ ingress:
           pathType: Prefix
   tls: []
 
-# Gateway API configuration (alternative to ingress)
-# Requires the Gateway API CRDs and a Gateway controller installed in the cluster.
-# The chart renders an HTTPRoute that attaches to an existing Gateway via parentRefs.
+# Gateway API configuration
 gatewayAPI:
   enabled: false
   httpRoute:
-    # apiVersion of the HTTPRoute resource. Override for older controllers (e.g. v1beta1).
     apiVersion: gateway.networking.k8s.io/v1
     annotations: {}
     labels: {}
-    # Gateway(s) this route attaches to. name is required; the rest are optional.
     parentRefs:
       - name: gateway
-        # namespace: gateway-system
-        # sectionName: https
-        # port: 443
-    # Hostnames this route matches. Leave empty to match all hostnames on the Gateway.
     hostnames:
       - crossview.example.com
-    # Routing rules. Each rule may override matches, filters, backendRefs and timeouts.
-    # Defaults: a single PathPrefix "/" match routed to the crossview service.
     rules:
       - matches:
           - path:
@@ -133,9 +120,6 @@ gatewayAPI:
               value: /
 
 # Database configuration
-# Bundled in-cluster Postgres is DISABLED: CrossView uses an external AWS RDS
-# instance instead (see config.database below). Leaving this true would deploy a
-# postgres:latest pod + 10Gi PVC that we do not want.
 database:
   enabled: false
   image:
@@ -173,31 +157,19 @@ config:
   ref: ""
   database:
     enabled: true
-    # External AWS RDS (Aurora PostgreSQL) CLUSTER WRITER endpoint.
-    # This is what the app actually uses (wired into the crossview-config
-    # ConfigMap -> DB_HOST env). The same value is ALSO synced into the secret
-    # prod-crossview-secrets (key: host) via the ExternalSecret below, so the host
-    # lives in Secrets Manager too. It must NOT be injected as a DB_HOST env, or it
-    # collides with the chart's own DB_HOST. Keep this value in sync with the
-    # `host` property in Secrets Manager (prod/devops/crossview).
-    host: "xplane-rds-cluster-01-cluster.cluster-cdzpb0fqqnyt.us-east-1.rds.amazonaws.com"
+    # Tells the ConfigMap to extract the text string directly from the secret 
+    # created during Argo's sync wave -1. This avoids the extraEnv collision entirely.
+    host: "$(DB_HOST)" 
     port: 5432
     database: crossview
-    # Dedicated least-privilege app role (owns the crossview DB); NOT the RDS
-    # master user. Its password lives in Secrets Manager prod/devops/crossview
-    # under db-password (synced via the ExternalSecret below).
     username: crossview
     ssl:
-        # RDS enforces TLS in this platform; verify against the AWS global CA
-        # bundle (see the nexus rds-ca-bundle pattern for mounting global-bundle.pem).
         mode: require
         rootCert: ""
         cert: ""
         key: ""
   server:
     port: 3001
-    # Optional short labels for kube contexts shown in UI badges.
-    # Example: { kind-kind: KIND, dev-cluster: DEV }
     contextAliases: {}
     auth:
       mode: session
@@ -207,10 +179,6 @@ config:
     log:
       level: info
     cors:
-      # Public root URL of this Crossview instance (no trailing slash).
-      # IMPORTANT: Change this to your actual ingress host in production.
-      # This value is used as the post-SSO-login redirect destination. If left
-      # as localhost, users will be redirected to localhost after SSO authentication.
       origin: http://localhost:5173
       credentials: true
     session:
@@ -219,30 +187,6 @@ config:
         httpOnly: true
         maxAge: 86400000
 
-  # SSO configuration (example values provided, but SSO is disabled by default)
-  # sso:
-  #   oidc:
-  #     enabled: true
-  #     issuer: http://localhost:8080/realms/crossview
-  #     clientId: crossview-client
-  #     authorizationURL: ""
-  #     tokenURL: ""
-  #     userInfoURL: ""
-  #     callbackURL: http://localhost:3001/api/auth/oidc/callback
-  #     scope: openid profile email
-  #     usernameAttribute: preferred_username
-  #     emailAttribute: email
-  #     firstNameAttribute: given_name
-  #     lastNameAttribute: family_name
-  #   saml:
-  #     enabled: true
-  #     entryPoint: http://localhost:8080/realms/crossview/protocol/saml
-  #     issuer: crossview
-  #     callbackURL: http://localhost:3001/api/auth/saml/callback
-  #     usernameAttribute: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name
-  #     emailAttribute: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress
-  #     firstNameAttribute: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/givenname
-  #     lastNameAttribute: http://schemas.xmlsoap.org/ws/2005/05/identity/claims/surname
   sso:
     oidc:
       enabled: false
@@ -257,45 +201,21 @@ config:
           changeOrigin: true
 
 # Secrets configuration
-# - Plain string: chart creates a secret with that value
-# - Object with secretKeyRef: references an existing secret (no creation)
 secrets:
   adminUsername: "admin"
-  # Admin password is fetched from AWS Secrets Manager (via the ExternalSecret in
-  # extraManifests below) into the k8s secret `prod-crossview-secrets`, same as
-  # dbPassword. Never commit a plaintext admin password.
   adminPassword:
     secretKeyRef:
       name: prod-crossview-secrets
       key: admin-password
-  # RDS password is fetched from AWS Secrets Manager (via the ExternalSecret in
-  # extraManifests below) into the k8s secret `prod-crossview-secrets`. Pod Identity
-  # is only the pipeline that lets ESO read Secrets Manager; CrossView receives a
-  # plain password string, so no RDS IAM token handling is needed.
-  # NOTE: the secret MUST exist before the pod starts, or the pod blocks on
-  # CreateContainerConfigError. The sync-wave annotation on the ExternalSecret
-  # orders its creation ahead of the Deployment.
   dbPassword:
     secretKeyRef:
       name: prod-crossview-secrets
       key: db-password
-  sessionSecret: ""
-  OIDCClientSecret: ""
-  SAMLCert: ""
-
-  # Production override example: use existing secrets instead of chart-created ones
-  # dbPassword:
-  #   secretKeyRef:
-  #     name: prod-crossview-secrets
-  #     key: db-password
-  # sessionSecret:
-  #   secretKeyRef:
-  #     name: prod-crossview-secrets
-  #     key: session-secret
-  # OIDCClientSecret:
-  #   secretKeyRef:
-  #     name: oidc-credentials
-  #     key: client-secret
+  # Feeds the correct secret payload string to resolve the host string safely.
+  dbHost:
+    secretKeyRef:
+      name: prod-crossview-secrets
+      key: host
 
 # Service Account
 serviceAccount:
@@ -331,10 +251,10 @@ nodeSelector: {}
 # Tolerations
 tolerations: []
 
-# Pod annotations (applied to app pods)
+# Pod annotations
 podAnnotations: {}
 
-# Pod labels (applied to app pods)
+# Pod labels
 podLabels: {}
 
 autoscaling:
@@ -342,21 +262,10 @@ autoscaling:
   minReplicas: 1
   maxReplicas: 10
 
-# Extra manifests
-# ExternalSecret that syncs the RDS password from AWS Secrets Manager into the
-# k8s secret `prod-crossview-secrets`, referenced by secrets.dbPassword above.
-# Mirrors the twingate-connector ExternalSecret pattern (ClusterSecretStore
-# `aws-cluster-secretstore`). The sync-wave "-1" makes ArgoCD create this (and thus
-# ESO create the secret) before the CrossView Deployment (default wave 0), avoiding
-# CreateContainerConfigError on first sync.
-# remoteRef.key is the Secrets Manager secret path: prod/devops/crossview
-# (holds host, db-password and admin-password). The host is synced into the secret
-# for reference, but the app consumes it via config.database.host (NOT as an env,
-# which would collide with the chart's DB_HOST). extraManifests items must be YAML
-# strings (see chart values.schema.json), hence the "|-" block below.
+# Extra manifests definition mapping
 extraManifests:
   - |-
-    apiVersion: external-secrets.io/v1
+    apiVersion: external-secrets.io/v1beta1
     kind: ExternalSecret
     metadata:
       name: prod-crossview-secrets
@@ -364,7 +273,7 @@ extraManifests:
       annotations:
         argocd.argoproj.io/sync-wave: "-1"
     spec:
-      refreshInterval: 1h
+      refreshInterval: "1h"
       secretStoreRef:
         name: aws-cluster-secretstore
         kind: ClusterSecretStore
@@ -372,15 +281,15 @@ extraManifests:
         name: prod-crossview-secrets
         creationPolicy: Owner
       data:
-        - secretKey: host
-          remoteRef:
-            key: prod/devops/crossview
-            property: host
-        - secretKey: db-password
-          remoteRef:
-            key: prod/devops/crossview
-            property: db-password
         - secretKey: admin-password
           remoteRef:
             key: prod/devops/crossview
             property: admin-password
+        - secretKey: db-password
+          remoteRef:
+            key: prod/devops/crossview
+            property: db-password
+        - secretKey: host
+          remoteRef:
+            key: prod/devops/crossview
+            property: host
