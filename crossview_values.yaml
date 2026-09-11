@@ -96,7 +96,7 @@ ingress:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
   hosts:
-    - host: crossview.example.com
+    - host: ://example.com
       paths:
         - path: /
           pathType: Prefix
@@ -112,7 +112,7 @@ gatewayAPI:
     parentRefs:
       - name: gateway
     hostnames:
-      - crossview.example.com
+      - ://example.com
     rules:
       - matches:
           - path:
@@ -265,7 +265,7 @@ autoscaling:
 # Extra manifests definition mapping
 extraManifests:
   - |-
-    apiVersion: external-secrets.io/v1beta1
+    apiVersion: external-secrets.io/v1
     kind: ExternalSecret
     metadata:
       name: prod-crossview-secrets
