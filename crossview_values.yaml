@@ -157,13 +157,9 @@ config:
   ref: ""
   database:
     enabled: true
-    # External AWS RDS (Aurora PostgreSQL) CLUSTER WRITER endpoint. The chart renders
-    # this string into the crossview-config ConfigMap -> DB_HOST env. It MUST be a real
-    # hostname: chart 4.6.0 has no way to source DB_HOST from a Secret (any $(VAR) here
-    # either self-references or references an extraEnv var rendered too late, and a second
-    # DB_HOST via extraEnv collides on apply). The value is also synced into
-    # prod-crossview-secrets (key: host) for reference, but the app consumes it from here.
-    host: "xplane-rds-cluster-01-cluster.cluster-cdzpb0fqqnyt.us-east-1.rds.amazonaws.com"
+    # Tells the ConfigMap to extract the text string directly from the secret 
+    # created during Argo's sync wave -1. This avoids the extraEnv collision entirely.
+    host: "$(DB_HOST)" 
     port: 5432
     database: crossview
     username: crossview
@@ -215,10 +211,11 @@ secrets:
     secretKeyRef:
       name: prod-crossview-secrets
       key: db-password
-  # NOTE: there is no `dbHost` secret key in this chart. The chart only recognizes
-  # dbPassword, adminPassword, adminUsername, sessionSecret, OIDCClientSecret and
-  # SAMLCert as secretKeyRef-capable. A `dbHost` entry here is silently ignored, so the
-  # host is set via config.database.host above (rendered into the ConfigMap DB_HOST).
+  # Feeds the correct secret payload string to resolve the host string safely.
+  dbHost:
+    secretKeyRef:
+      name: prod-crossview-secrets
+      key: host
 
 # Service Account
 serviceAccount:
@@ -292,3 +289,7 @@ extraManifests:
           remoteRef:
             key: prod/devops/crossview
             property: db-password
+        - secretKey: host
+          remoteRef:
+            key: prod/devops/crossview
+            property: host
