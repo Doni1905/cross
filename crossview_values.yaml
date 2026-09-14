@@ -19,12 +19,19 @@ app:
   port: 3001
   replicas: 1
   automountServiceAccountToken: null
-  # IMPORTANT: do NOT inject DB_HOST via extraEnv. The chart already renders a
-  # DB_HOST env from the ConfigMap; a second DB_HOST here collides on apply
-  # ("may not have more than one field specified at a time"). The host is synced
-  # into the secret prod-crossview-secrets (key: host) for reference/consistency,
-  # but the app consumes it through config.database.host below.
-  extraEnv: []
+  # DB_HOST is sourced from the secret prod-crossview-secrets (key: host).
+  # The chart always renders a DB_HOST env from the ConfigMap first, then appends
+  # everything in app.extraEnv AFTER it. Kubernetes allows duplicate env names and the
+  # LAST one wins, so this extraEnv entry overrides the ConfigMap value with the secret
+  # value. config.database.host is left empty below so no hostname is baked into the
+  # ConfigMap. The `host` key is populated in the secret by the ExternalSecret at the
+  # bottom of this file.
+  extraEnv:
+    - name: DB_HOST
+      valueFrom:
+        secretKeyRef:
+          name: prod-crossview-secrets
+          key: host
   extraVolumes: []
   extraVolumeMounts: []
   extraInitContainers: []
@@ -157,9 +164,12 @@ config:
   ref: ""
   database:
     enabled: true
-    # Tells the ConfigMap to extract the text string directly from the secret 
-    # created during Argo's sync wave -1. This avoids the extraEnv collision entirely.
-    host: "$(DB_HOST)" 
+    # Leave host empty: the real AWS RDS (Aurora PostgreSQL) CLUSTER WRITER endpoint is
+    # injected as the DB_HOST env from the secret via app.extraEnv above (rendered after
+    # the ConfigMap DB_HOST, so it wins). Keeping this empty avoids baking the hostname
+    # into the crossview-config ConfigMap. The chart falls back to "<release>-postgres"
+    # for the ConfigMap value, but that value is overridden at runtime by the secret.
+    host: ""
     port: 5432
     database: crossview
     username: crossview
@@ -211,11 +221,9 @@ secrets:
     secretKeyRef:
       name: prod-crossview-secrets
       key: db-password
-  # Feeds the correct secret payload string to resolve the host string safely.
-  dbHost:
-    secretKeyRef:
-      name: prod-crossview-secrets
-      key: host
+  # NOTE: the chart has no `dbHost` secret binding, so the host is not set here.
+  # DB_HOST is injected from the same secret (key: host) via app.extraEnv above, and the
+  # `host` key is populated in prod-crossview-secrets by the ExternalSecret below.
 
 # Service Account
 serviceAccount:
