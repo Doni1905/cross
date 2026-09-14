@@ -19,19 +19,12 @@ app:
   port: 3001
   replicas: 1
   automountServiceAccountToken: null
-  # DB_HOST is sourced from the secret prod-crossview-secrets (key: host).
-  # The chart always renders a DB_HOST env from the ConfigMap first, then appends
-  # everything in app.extraEnv AFTER it. Kubernetes allows duplicate env names and the
-  # LAST one wins, so this extraEnv entry overrides the ConfigMap value with the secret
-  # value. config.database.host is left empty below so no hostname is baked into the
-  # ConfigMap. The `host` key is populated in the secret by the ExternalSecret at the
-  # bottom of this file.
-  extraEnv:
-    - name: DB_HOST
-      valueFrom:
-        secretKeyRef:
-          name: prod-crossview-secrets
-          key: host
+  # IMPORTANT: do NOT inject DB_HOST via extraEnv. The chart already renders a
+  # DB_HOST env from the ConfigMap; a second DB_HOST here collides on apply
+  # ("may not have more than one field specified at a time"). The host is synced
+  # into the secret prod-crossview-secrets (key: host) for reference/consistency,
+  # but the app consumes it through config.database.host below.
+  extraEnv: []
   extraVolumes: []
   extraVolumeMounts: []
   extraInitContainers: []
@@ -164,12 +157,13 @@ config:
   ref: ""
   database:
     enabled: true
-    # Leave host empty: the real AWS RDS (Aurora PostgreSQL) CLUSTER WRITER endpoint is
-    # injected as the DB_HOST env from the secret via app.extraEnv above (rendered after
-    # the ConfigMap DB_HOST, so it wins). Keeping this empty avoids baking the hostname
-    # into the crossview-config ConfigMap. The chart falls back to "<release>-postgres"
-    # for the ConfigMap value, but that value is overridden at runtime by the secret.
-    host: ""
+    # External AWS RDS (Aurora PostgreSQL) CLUSTER WRITER endpoint. The chart renders
+    # this string into the crossview-config ConfigMap -> DB_HOST env. It MUST be a real
+    # hostname: chart 4.6.0 has no way to source DB_HOST from a Secret (any $(VAR) here
+    # either self-references or references an extraEnv var rendered too late, and a second
+    # DB_HOST via extraEnv collides on apply). The value is also synced into
+    # prod-crossview-secrets (key: host) for reference, but the app consumes it from here.
+    host: "xplane-rds-cluster-01-cluster.cluster-cdzpb0fqqnyt.us-east-1.rds.amazonaws.com"
     port: 5432
     database: crossview
     username: crossview
@@ -221,9 +215,10 @@ secrets:
     secretKeyRef:
       name: prod-crossview-secrets
       key: db-password
-  # NOTE: the chart has no `dbHost` secret binding, so the host is not set here.
-  # DB_HOST is injected from the same secret (key: host) via app.extraEnv above, and the
-  # `host` key is populated in prod-crossview-secrets by the ExternalSecret below.
+  # NOTE: there is no `dbHost` secret key in this chart. The chart only recognizes
+  # dbPassword, adminPassword, adminUsername, sessionSecret, OIDCClientSecret and
+  # SAMLCert as secretKeyRef-capable. A `dbHost` entry here is silently ignored, so the
+  # host is set via config.database.host above (rendered into the ConfigMap DB_HOST).
 
 # Service Account
 serviceAccount:
@@ -297,7 +292,3 @@ extraManifests:
           remoteRef:
             key: prod/devops/crossview
             property: db-password
-        - secretKey: host
-          remoteRef:
-            key: prod/devops/crossview
-            property: host
