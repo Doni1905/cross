@@ -90,20 +90,13 @@ service:
 
 # Ingress configuration
 ingress:
-  enabled: true
-  className: "alb"
+  enabled: false
+  className: nginx
   annotations:
-    alb.ingress.kubernetes.io/certificate-arn: 'arn:aws:acm:us-east-1:014032199917:certificate/71b6b3a0-a62b-4345-954e-9742817f417f'
-    alb.ingress.kubernetes.io/group.name: 'dashboards'
-    alb.ingress.kubernetes.io/scheme: internet-facing
-    alb.ingress.kubernetes.io/target-type: ip
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
-    alb.ingress.kubernetes.io/ssl-redirect: "443"
-    alb.ingress.kubernetes.io/healthcheck-path: "/api/health"
-    alb.ingress.kubernetes.io/inbound-cidrs: 5.195.77.168/29,3.69.57.207/32
-  labels: {}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
   hosts:
-    - host: crossview.devops.tpconnects.com
+    - host: ://example.com
       paths:
         - path: /
           pathType: Prefix
@@ -119,7 +112,7 @@ gatewayAPI:
     parentRefs:
       - name: gateway
     hostnames:
-      - crossview.example.com
+      - ://example.com
     rules:
       - matches:
           - path:
@@ -190,16 +183,13 @@ config:
     log:
       level: info
     cors:
-      # Public root URL of this instance; used as the post-SSO-login redirect.
-      origin: https://crossview.devops.tpconnects.com
+      origin: http://localhost:5173
       credentials: true
     session:
       cookie:
-        # TLS is terminated at the ALB (HTTPS:443), so the cookie must be marked secure.
-        secure: true
+        secure: false
         httpOnly: true
         maxAge: 86400000
-
 
   sso:
     oidc:
