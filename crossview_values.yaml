@@ -246,22 +246,21 @@ secrets:
   # (username: postgres, password: db-password) so the app can authenticate.
 
 # Service Account
-# TESTING: the pod runs as the namespace default ServiceAccount (create: false) and its
-# token IS projected into the pod (app.automountServiceAccountToken: true above). The
-# default SA usually has no cluster RBAC, so in-cluster API calls made with it may be
-# denied. Note the app still prefers KUBECONFIG (hostPath) when that file is present.
+# A dedicated ServiceAccount is created for the pod. Its token IS projected into the pod
+# (app.automountServiceAccountToken: true above). Bind RBAC to this SA if you want the
+# pod to make in-cluster API calls with the token. Note the app still prefers KUBECONFIG
+# (hostPath) when that file is present.
 serviceAccount:
-  create: false
-  name: ""
+  create: true
+  name: crossview-sa
   annotations: {}
 
 # RBAC
-# No ClusterRole/Binding is created here (create: false). When the app uses KUBECONFIG,
-# access is governed by each target cluster's RBAC via the kubeconfig user credentials.
-# If you want the pod to act via its in-cluster ServiceAccount token instead, set
-# create: true and bind the permissions the app needs.
+# A ClusterRole and ClusterRoleBinding are created and bound to the crossview-sa
+# ServiceAccount, giving the pod in-cluster API permissions via its projected token.
+# (The app still prefers KUBECONFIG when that file is present.)
 rbac:
-  create: false
+  create: true
   clusterRole:
     name: crossview-role
   clusterRoleBinding:
