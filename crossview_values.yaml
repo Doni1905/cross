@@ -32,20 +32,24 @@ app:
     # Point the Kubernetes client at the kubeconfig file. When set, Crossview
     # reads every context in this file and renders the multi-cluster switcher.
     - name: KUBECONFIG
-      value: /home/crossview/.kube/config
-  # Kubeconfig is sourced from a file path on the node (hostPath), not from a Secret and
-  # not embedded in this values file. Place the kubeconfig at /home/crossview/.kube/config
-  # on the node; it is mounted read-only into the pod at the same path.
-  # type: DirectoryOrCreate so the mount does not fail if the dir is missing (it will be
-  # created empty — you must still put the `config` file there for the app to read it).
+      value: /etc/crossview/kube/config
+  # Kubeconfig is sourced from the prod-crossview-kubeconfig Secret (key: config),
+  # mounted read-only at /etc/crossview/kube/config. Nothing sensitive is in this values
+  # file, and it works on any node (no hostPath / node access required). For this test the
+  # Secret was created manually:
+  #   kubectl -n crossview create secret generic prod-crossview-kubeconfig \
+  #     --from-file=config=$HOME/.kube/config
   extraVolumes:
     - name: kubeconfig
-      hostPath:
-        path: /home/crossview/.kube
-        type: DirectoryOrCreate
+      secret:
+        secretName: prod-crossview-kubeconfig
+        items:
+          - key: config
+            path: config
+        defaultMode: 0400
   extraVolumeMounts:
     - name: kubeconfig
-      mountPath: /home/crossview/.kube
+      mountPath: /etc/crossview/kube
       readOnly: true
   extraInitContainers: []
   securityContext:
@@ -198,8 +202,6 @@ config:
     # multi-cluster switcher sidebar. Keys are the exact context names from the
     # mounted kubeconfig; values are the labels. Adjust to match your contexts.
     contextAliases: {}
-      # arn:aws:eks:us-east-1:123456789012:cluster/prod: PROD
-      # arn:aws:eks:us-east-1:123456789012:cluster/staging: STAGING
     auth:
       mode: session
       trustedHeader: X-Auth-User
@@ -282,6 +284,7 @@ affinity:
           topologyKey: kubernetes.io/hostname
 
 # Node selector
+# No pinning needed: the kubeconfig comes from a Secret, so the pod can run on any node.
 nodeSelector: {}
 
 # Tolerations
