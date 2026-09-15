@@ -33,15 +33,16 @@ app:
     # reads every context in this file and renders the multi-cluster switcher.
     - name: KUBECONFIG
       value: /home/crossview/.kube/config
-  # TESTING: kubeconfig sourced from a file path on the node (hostPath) instead of a
-  # Secret. The file at hostPath.path on the node is mounted into the pod at mountPath.
-  # Revert to the Secret-based mount for production.
+  # Kubeconfig is sourced from a file path on the node (hostPath), not from a Secret and
+  # not embedded in this values file. Place the kubeconfig at /home/crossview/.kube/config
+  # on the node; it is mounted read-only into the pod at the same path.
+  # type: DirectoryOrCreate so the mount does not fail if the dir is missing (it will be
+  # created empty — you must still put the `config` file there for the app to read it).
   extraVolumes:
     - name: kubeconfig
       hostPath:
-        # Path to the kubeconfig file on the node. Adjust to where your test file lives.
         path: /home/crossview/.kube
-        type: Directory
+        type: DirectoryOrCreate
   extraVolumeMounts:
     - name: kubeconfig
       mountPath: /home/crossview/.kube
@@ -324,6 +325,6 @@ extraManifests:
           remoteRef:
             key: prod/devops/crossview
             property: db-password
-  # TESTING: kubeconfig is provided via a hostPath file mount (see app.extraVolumes),
-  # not via a Secret. The prod-crossview-kubeconfig ExternalSecret has been removed for
-  # now. Re-add it and switch app.extraVolumes back to the Secret mount for production.
+  # Kubeconfig is provided via a hostPath file mount (see app.extraVolumes) — the file
+  # lives on the node at /home/crossview/.kube/config, not in a Secret or ConfigMap and
+  # not in this values file. No ExternalSecret is needed for the kubeconfig.
