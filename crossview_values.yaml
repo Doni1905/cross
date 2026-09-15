@@ -18,15 +18,34 @@ app:
   name: crossview
   port: 3001
   replicas: 1
-  automountServiceAccountToken: null
+  # TESTING: the in-cluster ServiceAccount token is projected into the pod.
+  # Note: when a kubeconfig is also present (KUBECONFIG below), the Kubernetes client
+  # typically prefers KUBECONFIG. Having the token mounted does not by itself switch
+  # auth modes — it just makes the token available in the pod.
+  automountServiceAccountToken: true
   # IMPORTANT: do NOT inject DB_HOST via extraEnv. The chart already renders a
   # DB_HOST env from the ConfigMap; a second DB_HOST here collides on apply
-  # ("may not have more than one field specified at a time"). The host is synced
-  # into the secret prod-crossview-secrets (key: host) for reference/consistency,
-  # but the app consumes it through config.database.host below.
-  extraEnv: []
-  extraVolumes: []
-  extraVolumeMounts: []
+  # ("may not have more than one field specified at a time"). The app consumes the
+  # database host through config.database.host below (points at the in-cluster
+  # Postgres service deployed by this chart when database.enabled is true).
+  extraEnv:
+    # Point the Kubernetes client at the kubeconfig file. When set, Crossview
+    # reads every context in this file and renders the multi-cluster switcher.
+    - name: KUBECONFIG
+      value: /home/crossview/.kube/config
+  # TESTING: kubeconfig sourced from a file path on the node (hostPath) instead of a
+  # Secret. The file at hostPath.path on the node is mounted into the pod at mountPath.
+  # Revert to the Secret-based mount for production.
+  extraVolumes:
+    - name: kubeconfig
+      hostPath:
+        # Path to the kubeconfig file on the node. Adjust to where your test file lives.
+        path: /home/crossview/.kube
+        type: Directory
+  extraVolumeMounts:
+    - name: kubeconfig
+      mountPath: /home/crossview/.kube
+      readOnly: true
   extraInitContainers: []
   securityContext:
     runAsNonRoot: true
@@ -96,7 +115,7 @@ ingress:
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
   hosts:
-    - host: ://example.com
+    - host: crossview.example.com
       paths:
         - path: /
           pathType: Prefix
@@ -112,7 +131,7 @@ gatewayAPI:
     parentRefs:
       - name: gateway
     hostnames:
-      - ://example.com
+      - crossview.example.com
     rules:
       - matches:
           - path:
@@ -121,10 +140,12 @@ gatewayAPI:
 
 # Database configuration
 database:
-  enabled: false
+  enabled: true
   image:
     repository: postgres
-    tag: "latest"
+    # Pin a major version. Avoid "latest" for databases: an unplanned major-version
+    # bump on a pod restart can break on-disk data/schema compatibility.
+    tag: "16"
   resources:
     requests:
       memory: "256Mi"
@@ -157,24 +178,27 @@ config:
   ref: ""
   database:
     enabled: true
-    # External AWS RDS (Aurora PostgreSQL) CLUSTER WRITER endpoint. The chart renders
-    # this string into the crossview-config ConfigMap -> DB_HOST env. It MUST be a real
-    # hostname: chart 4.6.0 has no way to source DB_HOST from a Secret (any $(VAR) here
-    # either self-references or references an extraEnv var rendered too late, and a second
-    # DB_HOST via extraEnv collides on apply). The value is also synced into
-    # prod-crossview-secrets (key: host) for reference, but the app consumes it from here.
-    host: "xplane-rds-cluster-01-cluster.cluster-cdzpb0fqqnyt.us-east-1.rds.amazonaws.com"
+    # In-cluster Postgres deployed by this chart (database.enabled: true above).
+    # This MUST be the Postgres Service name the chart creates. Verify against the
+    # chart's service template — common values are "crossview-postgres" or
+    # "crossview-db". Update if the chart uses a different name.
+    host: "crossview-postgres"
     port: 5432
     database: crossview
-    username: crossview
+    username: postgres
     ssl:
-        mode: require
+        mode: disable
         rootCert: ""
         cert: ""
         key: ""
   server:
     port: 3001
+    # Short UI labels for long kube context names, shown as badges in the
+    # multi-cluster switcher sidebar. Keys are the exact context names from the
+    # mounted kubeconfig; values are the labels. Adjust to match your contexts.
     contextAliases: {}
+      # arn:aws:eks:us-east-1:123456789012:cluster/prod: PROD
+      # arn:aws:eks:us-east-1:123456789012:cluster/staging: STAGING
     auth:
       mode: session
       trustedHeader: X-Auth-User
@@ -215,20 +239,29 @@ secrets:
     secretKeyRef:
       name: prod-crossview-secrets
       key: db-password
-  # NOTE: there is no `dbHost` secret key in this chart. The chart only recognizes
-  # dbPassword, adminPassword, adminUsername, sessionSecret, OIDCClientSecret and
-  # SAMLCert as secretKeyRef-capable. A `dbHost` entry here is silently ignored, so the
-  # host is set via config.database.host above (rendered into the ConfigMap DB_HOST).
+  # NOTE: the DB host is not a secret. It is set via config.database.host above
+  # (the in-cluster Postgres service name), which the chart renders into the
+  # ConfigMap DB_HOST. This secret only supplies db-password / admin-password.
+  # Ensure the built-in Postgres is initialized with the same username/password
+  # (username: postgres, password: db-password) so the app can authenticate.
 
 # Service Account
+# TESTING: the pod runs as the namespace default ServiceAccount (create: false) and its
+# token IS projected into the pod (app.automountServiceAccountToken: true above). The
+# default SA usually has no cluster RBAC, so in-cluster API calls made with it may be
+# denied. Note the app still prefers KUBECONFIG (hostPath) when that file is present.
 serviceAccount:
-  create: true
-  name: crossview-sa
+  create: false
+  name: ""
   annotations: {}
 
 # RBAC
+# No ClusterRole/Binding is created here (create: false). When the app uses KUBECONFIG,
+# access is governed by each target cluster's RBAC via the kubeconfig user credentials.
+# If you want the pod to act via its in-cluster ServiceAccount token instead, set
+# create: true and bind the permissions the app needs.
 rbac:
-  create: true
+  create: false
   clusterRole:
     name: crossview-role
   clusterRoleBinding:
@@ -292,3 +325,6 @@ extraManifests:
           remoteRef:
             key: prod/devops/crossview
             property: db-password
+  # TESTING: kubeconfig is provided via a hostPath file mount (see app.extraVolumes),
+  # not via a Secret. The prod-crossview-kubeconfig ExternalSecret has been removed for
+  # now. Re-add it and switch app.extraVolumes back to the Secret mount for production.
