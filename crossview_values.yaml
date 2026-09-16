@@ -37,25 +37,40 @@ app:
   # IMPORTANT: do NOT inject DB_HOST via extraEnv — the chart already renders DB_HOST
   # from the ConfigMap and a second one collides on apply. The DB host is set through
   # config.database.host below.
+  # ===== PHASE 0 PROBE (TEMPORARY) =====================================================
+  # Gate test: does Crossview 4.6.0 render a multi-context switcher in-cluster? We mount a
+  # self-contained 2-context kubeconfig (ConfigMap crossview-kubeconfig-probe, see
+  # extraManifests) with a real in-cluster context + a dummy one. We only check whether
+  # the UI LISTS both. Revert this whole block after the test (original settings kept
+  # commented below).
   extraEnv:
-    # Point the Kubernetes client at the mounted kubeconfig. Crossview parses every
-    # context in this file and exposes the multi-cluster switcher.
     - name: KUBECONFIG
-      value: /home/crossview/.kube/config
-  # Mount the kubeconfig (delivered by ESO into the prod-crossview-kubeconfig Secret)
-  # read-only. The Secret must contain a single key `config` holding the kubeconfig YAML.
+      value: /kube/config
   extraVolumes:
-    - name: kubeconfig
-      secret:
-        secretName: prod-crossview-kubeconfig
-        items:
-          - key: config
-            path: config
-        defaultMode: 0400
+    - name: kubeconfig-probe
+      configMap:
+        name: crossview-kubeconfig-probe
   extraVolumeMounts:
-    - name: kubeconfig
-      mountPath: /home/crossview/.kube
+    - name: kubeconfig-probe
+      mountPath: /kube
       readOnly: true
+  # ----- ORIGINAL multi-cluster (ESO) mount — restore after the probe -------------------
+  # extraEnv:
+  #   - name: KUBECONFIG
+  #     value: /home/crossview/.kube/config
+  # extraVolumes:
+  #   - name: kubeconfig
+  #     secret:
+  #       secretName: prod-crossview-kubeconfig
+  #       items:
+  #         - key: config
+  #           path: config
+  #       defaultMode: 0400
+  # extraVolumeMounts:
+  #   - name: kubeconfig
+  #     mountPath: /home/crossview/.kube
+  #     readOnly: true
+  # ===== END PHASE 0 PROBE =============================================================
   extraInitContainers: []
   securityContext:
     runAsNonRoot: true
@@ -335,31 +350,72 @@ extraManifests:
           remoteRef:
             key: prod/devops/crossview
             property: db-password
-  # Multi-cluster kubeconfig. Stored in Secrets Manager under prod/devops/kubeconfig as
-  # JSON with a `kubeconfig` key holding the full kubeconfig YAML string. ESO writes it
-  # to Secret key `config`, mounted at /home/crossview/.kube/config.
-  #
-  # If you instead store the RAW kubeconfig file as the secret string (not JSON), remove
-  # the `property: kubeconfig` line so ESO uses the whole secret value.
+  # ===== PHASE 0 PROBE (TEMPORARY) =====================================================
+  # Self-contained 2-context kubeconfig for the gate test. Replaces the ESO-backed
+  # kubeconfig ExternalSecret so we are NOT dependent on the AWS secret
+  # prod/devops/kubeconfig (which does not exist yet — that was the "Secret does not
+  # exist" error). Two contexts: cluster-1 (real, in-cluster SA) and cluster-dummy (fake).
+  # We only check whether the UI lists BOTH. cluster-dummy will error if clicked — fine.
+  # NOTE: with automountServiceAccountToken:false the SA files won't exist, so cluster-1
+  # may not connect either — that does not affect the listing test.
   - |-
-    apiVersion: external-secrets.io/v1
-    kind: ExternalSecret
+    apiVersion: v1
+    kind: ConfigMap
     metadata:
-      name: prod-crossview-kubeconfig
+      name: crossview-kubeconfig-probe
       namespace: crossview
-      annotations:
-        argocd.argoproj.io/sync-wave: "-1"
-    spec:
-      # Shorter interval keeps rotated ServiceAccount tokens fresh in the pod.
-      refreshInterval: "15m"
-      secretStoreRef:
-        name: aws-cluster-secretstore
-        kind: ClusterSecretStore
-      target:
-        name: prod-crossview-kubeconfig
-        creationPolicy: Owner
-      data:
-        - secretKey: config
-          remoteRef:
-            key: prod/devops/kubeconfig
-            property: kubeconfig
+    data:
+      config: |
+        apiVersion: v1
+        kind: Config
+        clusters:
+          - name: real
+            cluster:
+              server: https://kubernetes.default.svc
+              certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          - name: dummy
+            cluster:
+              server: https://example.invalid
+              insecure-skip-tls-verify: true
+        users:
+          - name: real
+            user:
+              tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+          - name: dummy
+            user:
+              token: dummy
+        contexts:
+          - name: cluster-1
+            context:
+              cluster: real
+              user: real
+          - name: cluster-dummy
+            context:
+              cluster: dummy
+              user: dummy
+        current-context: cluster-1
+  # ----- ORIGINAL ESO kubeconfig ExternalSecret — restore after the probe ---------------
+  # Stored in Secrets Manager under prod/devops/kubeconfig as JSON with a `kubeconfig`
+  # key. If you store the RAW file instead, drop the `property: kubeconfig` line.
+  # - |-
+  #   apiVersion: external-secrets.io/v1
+  #   kind: ExternalSecret
+  #   metadata:
+  #     name: prod-crossview-kubeconfig
+  #     namespace: crossview
+  #     annotations:
+  #       argocd.argoproj.io/sync-wave: "-1"
+  #   spec:
+  #     refreshInterval: "15m"
+  #     secretStoreRef:
+  #       name: aws-cluster-secretstore
+  #       kind: ClusterSecretStore
+  #     target:
+  #       name: prod-crossview-kubeconfig
+  #       creationPolicy: Owner
+  #     data:
+  #       - secretKey: config
+  #         remoteRef:
+  #           key: prod/devops/kubeconfig
+  #           property: kubeconfig
+  # ===== END PHASE 0 PROBE =============================================================
