@@ -1,0 +1,365 @@
+# Default values for crossview — SECURE MULTI-CLUSTER configuration.
+#
+# Auth model (see multi-cluster/README.md for the full rationale):
+#   - The Crossview IMAGE (alpine + Go binary) has NO aws CLI / kubectl, so it CANNOT
+#     use `aws eks get-token` exec auth. Cluster auth therefore uses per-cluster
+#     read-only ServiceAccount bearer tokens embedded in the kubeconfig.
+#   - The kubeconfig is stored in AWS Secrets Manager (encrypted, never in Git) and
+#     pulled into the pod by External Secrets Operator (ESO).
+#   - ESO authenticates to AWS via EKS Pod Identity (no static AWS keys anywhere).
+#   - ESO refreshInterval re-pulls the kubeconfig so rotated tokens propagate.
+#   - Crossview reads every context in the mounted kubeconfig and renders the
+#     multi-cluster switcher; contextAliases give the contexts short UI labels.
+
+# Global settings
+global:
+  namespace: crossview
+  createNamespace: true
+
+# Image configuration
+image:
+  repository: ghcr.io/crossplane-contrib/crossview
+  pullPolicy: Always
+  tag: ""
+  platform: ""
+
+# Application configuration
+app:
+  name: crossview
+  port: 3001
+  replicas: 1
+  # Multi-cluster mode: do NOT project the in-cluster ServiceAccount token. With the
+  # token absent, the Kubernetes client falls back to KUBECONFIG (set below), so
+  # Crossview authenticates to each cluster using the kubeconfig's embedded tokens
+  # rather than its own in-cluster identity. This also keeps the pod from holding any
+  # ambient cluster-admin-ish credentials it doesn't need.
+  automountServiceAccountToken: false
+  # IMPORTANT: do NOT inject DB_HOST via extraEnv — the chart already renders DB_HOST
+  # from the ConfigMap and a second one collides on apply. The DB host is set through
+  # config.database.host below.
+  extraEnv:
+    # Point the Kubernetes client at the mounted kubeconfig. Crossview parses every
+    # context in this file and exposes the multi-cluster switcher.
+    - name: KUBECONFIG
+      value: /home/crossview/.kube/config
+  # Mount the kubeconfig (delivered by ESO into the prod-crossview-kubeconfig Secret)
+  # read-only. The Secret must contain a single key `config` holding the kubeconfig YAML.
+  extraVolumes:
+    - name: kubeconfig
+      secret:
+        secretName: prod-crossview-kubeconfig
+        items:
+          - key: config
+            path: config
+        defaultMode: 0400
+  extraVolumeMounts:
+    - name: kubeconfig
+      mountPath: /home/crossview/.kube
+      readOnly: true
+  extraInitContainers: []
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    runAsNonRoot: true
+    runAsUser: 1000
+    capabilities:
+      drop:
+        - ALL
+
+# Deployment strategy
+deployment:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+# Resource limits and requests
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "250m"
+  limits:
+    memory: "1Gi"
+    cpu: "1000m"
+
+# Health checks
+healthCheck:
+  livenessProbe:
+    httpGet:
+      path: /api/health
+      port: 3001
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+  readinessProbe:
+    httpGet:
+      path: /api/health
+      port: 3001
+    initialDelaySeconds: 10
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3001
+  sessionAffinity: ClientIP
+  sessionAffinityTimeout: 10800
+  annotations: {}
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+  hosts:
+    - host: crossview.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Gateway API configuration
+gatewayAPI:
+  enabled: false
+  httpRoute:
+    apiVersion: gateway.networking.k8s.io/v1
+    annotations: {}
+    labels: {}
+    parentRefs:
+      - name: gateway
+    hostnames:
+      - crossview.example.com
+    rules:
+      - matches:
+          - path:
+              type: PathPrefix
+              value: /
+
+# Database configuration
+# session auth mode requires PostgreSQL. Using the bundled Postgres here; switch to an
+# external RDS host via config.database.host if you prefer.
+database:
+  enabled: true
+  image:
+    repository: postgres
+    # Pin a major version — never "latest" for a database.
+    tag: "16"
+  resources:
+    requests:
+      memory: "256Mi"
+      cpu: "250m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+  persistence:
+    enabled: true
+    size: 10Gi
+    accessMode: ReadWriteOnce
+    storageClass: ""
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    fsGroup: 999
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    runAsNonRoot: true
+    runAsUser: 999
+    capabilities:
+      drop:
+        - ALL
+
+# Configuration
+config:
+  ref: ""
+  database:
+    enabled: true
+    # Bundled in-cluster Postgres service name created by this chart. Verify against the
+    # chart's service template if the app cannot connect.
+    host: "crossview-postgres"
+    port: 5432
+    database: crossview
+    username: postgres
+    ssl:
+      mode: disable
+      rootCert: ""
+      cert: ""
+      key: ""
+  server:
+    port: 3001
+    # Short UI labels for long kube context names, shown as badges in the multi-cluster
+    # switcher. Keys MUST match the exact context names in your kubeconfig (see
+    # multi-cluster/build-kubeconfig.sh, which names contexts after --context-name).
+    contextAliases:
+      hub: HUB
+      prod: PROD
+      staging: STAGING
+    auth:
+      mode: session
+      trustedHeader: X-Auth-User
+      createUsers: true
+      defaultRole: viewer
+    log:
+      level: info
+    cors:
+      # Set to the public URL of this Crossview instance in production, otherwise
+      # post-login SSO redirects go to localhost.
+      origin: http://localhost:5173
+      credentials: true
+    session:
+      cookie:
+        secure: false
+        httpOnly: true
+        maxAge: 86400000
+
+  sso:
+    oidc:
+      enabled: false
+    saml:
+      enabled: false
+
+  vite:
+    server:
+      proxy:
+        api:
+          target: http://localhost:3001
+          changeOrigin: true
+
+# Secrets configuration
+# admin/db passwords come from ESO-managed Secret prod-crossview-secrets (never in Git).
+secrets:
+  adminUsername: "admin"
+  adminPassword:
+    secretKeyRef:
+      name: prod-crossview-secrets
+      key: admin-password
+  dbPassword:
+    secretKeyRef:
+      name: prod-crossview-secrets
+      key: db-password
+
+# Service Account
+# In multi-cluster (kubeconfig) mode Crossview authenticates to each cluster with the
+# tokens embedded in the kubeconfig, NOT an in-cluster ServiceAccount token. We do not
+# create a SA or bind cluster RBAC; the default SA (token automount disabled above) only
+# schedules the pod.
+serviceAccount:
+  create: false
+  name: ""
+  annotations: {}
+
+# RBAC
+# Not needed in kubeconfig mode — access on each target cluster is governed by the
+# read-only ClusterRole bound to the per-cluster crossview-viewer ServiceAccount.
+rbac:
+  create: false
+  clusterRole:
+    name: crossview-role
+  clusterRoleBinding:
+    name: crossview-binding
+
+# Pod affinity
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values:
+                  - crossview
+          topologyKey: kubernetes.io/hostname
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod labels
+podLabels: {}
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+
+# Extra manifests: ESO ExternalSecrets that pull app secrets AND the multi-cluster
+# kubeconfig from AWS Secrets Manager. ESO authenticates to AWS via EKS Pod Identity
+# (the aws-cluster-secretstore ClusterSecretStore needs NO auth block when Pod Identity
+# is used). refreshInterval re-pulls the kubeconfig so rotated tokens propagate.
+extraManifests:
+  # App credentials (admin + db passwords)
+  - |-
+    apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: prod-crossview-secrets
+      namespace: crossview
+      annotations:
+        argocd.argoproj.io/sync-wave: "-1"
+    spec:
+      refreshInterval: "1h"
+      secretStoreRef:
+        name: aws-cluster-secretstore
+        kind: ClusterSecretStore
+      target:
+        name: prod-crossview-secrets
+        creationPolicy: Owner
+      data:
+        - secretKey: admin-password
+          remoteRef:
+            key: prod/devops/crossview
+            property: admin-password
+        - secretKey: db-password
+          remoteRef:
+            key: prod/devops/crossview
+            property: db-password
+  # Multi-cluster kubeconfig. Stored in Secrets Manager under prod/devops/kubeconfig as
+  # JSON with a `kubeconfig` key holding the full kubeconfig YAML string. ESO writes it
+  # to Secret key `config`, mounted at /home/crossview/.kube/config.
+  #
+  # If you instead store the RAW kubeconfig file as the secret string (not JSON), remove
+  # the `property: kubeconfig` line so ESO uses the whole secret value.
+  - |-
+    apiVersion: external-secrets.io/v1
+    kind: ExternalSecret
+    metadata:
+      name: prod-crossview-kubeconfig
+      namespace: crossview
+      annotations:
+        argocd.argoproj.io/sync-wave: "-1"
+    spec:
+      # Shorter interval keeps rotated ServiceAccount tokens fresh in the pod.
+      refreshInterval: "15m"
+      secretStoreRef:
+        name: aws-cluster-secretstore
+        kind: ClusterSecretStore
+      target:
+        name: prod-crossview-kubeconfig
+        creationPolicy: Owner
+      data:
+        - secretKey: config
+          remoteRef:
+            key: prod/devops/kubeconfig
+            property: kubeconfig
