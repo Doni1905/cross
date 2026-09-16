@@ -1,15 +1,23 @@
-# Default values for crossview — SECURE MULTI-CLUSTER configuration.
+# Default values for crossview — MULTI-CLUSTER via token-refresher.
 #
-# Auth model (see multi-cluster/README.md for the full rationale):
-#   - The Crossview IMAGE (alpine + Go binary) has NO aws CLI / kubectl, so it CANNOT
-#     use `aws eks get-token` exec auth. Cluster auth therefore uses per-cluster
-#     read-only ServiceAccount bearer tokens embedded in the kubeconfig.
-#   - The kubeconfig is stored in AWS Secrets Manager (encrypted, never in Git) and
-#     pulled into the pod by External Secrets Operator (ESO).
-#   - ESO authenticates to AWS via EKS Pod Identity (no static AWS keys anywhere).
-#   - ESO refreshInterval re-pulls the kubeconfig so rotated tokens propagate.
-#   - Crossview reads every context in the mounted kubeconfig and renders the
-#     multi-cluster switcher; contextAliases give the contexts short UI labels.
+# Architecture (see multi-cluster/README.md for full detail):
+#   - The Crossview IMAGE (alpine + Go binary) has NO aws CLI, so kubeconfig `exec` auth
+#     (aws eks get-token) cannot run in the Crossview pod.
+#   - Instead a small SEPARATE Deployment (crossview-token-refresher, image amazon/aws-cli)
+#     runs `aws eks get-token` for each remote cluster every ~10 min and writes the tokens
+#     into Secret `crossview-remote-tokens` via the local Kubernetes REST API (curl +
+#     its own ServiceAccount token — NO kubectl needed).
+#   - The refresher's ServiceAccount (crossview-token-refresher) has an EKS Pod Identity
+#     association to IAM role CrossviewPodIdentityRole (eks:DescribeCluster + get-token),
+#     and access entries (AmazonEKSViewPolicy) on each remote cluster.
+#   - Crossview mounts a kubeconfig ConfigMap (endpoints + CA data, no secrets) whose
+#     remote users reference tokenFile: /tokens/c2 and /tokens/c3. It reads every context
+#     and renders the multi-cluster switcher (gate test PASSED).
+#
+# GATE PASSED: Crossview 4.6.0 lists all contexts from a mounted multi-context kubeconfig.
+#
+# ==> FILL IN the CLUSTER_2 / CLUSTER_3 names, endpoints and CA data below (search PLACEHOLDER).
+#     Run multi-cluster/collect-cluster-facts.sh to gather them.
 
 # Global settings
 global:
@@ -28,49 +36,31 @@ app:
   name: crossview
   port: 3001
   replicas: 1
-  # Multi-cluster mode: do NOT project the in-cluster ServiceAccount token. With the
-  # token absent, the Kubernetes client falls back to KUBECONFIG (set below), so
-  # Crossview authenticates to each cluster using the kubeconfig's embedded tokens
-  # rather than its own in-cluster identity. This also keeps the pod from holding any
-  # ambient cluster-admin-ish credentials it doesn't need.
+  # Multi-cluster mode: do NOT project the in-cluster ServiceAccount token. Crossview
+  # decides in-cluster vs multi-cluster by checking whether the SA token file exists
+  # (see kubernetes_context.go isInCluster()). With the token absent it uses KUBECONFIG,
+  # which is what enables the switcher. cluster-1 (the local cluster) is therefore also
+  # reached via a refreshed token file (/tokens/c1), NOT the in-cluster SA.
   automountServiceAccountToken: false
-  # IMPORTANT: do NOT inject DB_HOST via extraEnv — the chart already renders DB_HOST
-  # from the ConfigMap and a second one collides on apply. The DB host is set through
-  # config.database.host below.
-  # ===== PHASE 0 PROBE (TEMPORARY) =====================================================
-  # Gate test: does Crossview 4.6.0 render a multi-context switcher in-cluster? We mount a
-  # self-contained 2-context kubeconfig (ConfigMap crossview-kubeconfig-probe, see
-  # extraManifests) with a real in-cluster context + a dummy one. We only check whether
-  # the UI LISTS both. Revert this whole block after the test (original settings kept
-  # commented below).
   extraEnv:
     - name: KUBECONFIG
       value: /kube/config
   extraVolumes:
-    - name: kubeconfig-probe
+    # Kubeconfig (endpoints + CA data, no secrets) from the ConfigMap in extraManifests.
+    - name: kubeconfig
       configMap:
-        name: crossview-kubeconfig-probe
+        name: crossview-kubeconfig
+    # Remote (and local) cluster tokens, refreshed by the token-refresher Deployment.
+    - name: remote-tokens
+      secret:
+        secretName: crossview-remote-tokens
   extraVolumeMounts:
-    - name: kubeconfig-probe
+    - name: kubeconfig
       mountPath: /kube
       readOnly: true
-  # ----- ORIGINAL multi-cluster (ESO) mount — restore after the probe -------------------
-  # extraEnv:
-  #   - name: KUBECONFIG
-  #     value: /home/crossview/.kube/config
-  # extraVolumes:
-  #   - name: kubeconfig
-  #     secret:
-  #       secretName: prod-crossview-kubeconfig
-  #       items:
-  #         - key: config
-  #           path: config
-  #       defaultMode: 0400
-  # extraVolumeMounts:
-  #   - name: kubeconfig
-  #     mountPath: /home/crossview/.kube
-  #     readOnly: true
-  # ===== END PHASE 0 PROBE =============================================================
+    - name: remote-tokens
+      mountPath: /tokens
+      readOnly: true
   extraInitContainers: []
   securityContext:
     runAsNonRoot: true
@@ -164,13 +154,10 @@ gatewayAPI:
               value: /
 
 # Database configuration
-# session auth mode requires PostgreSQL. Using the bundled Postgres here; switch to an
-# external RDS host via config.database.host if you prefer.
 database:
   enabled: true
   image:
     repository: postgres
-    # Pin a major version — never "latest" for a database.
     tag: "16"
   resources:
     requests:
@@ -204,8 +191,6 @@ config:
   ref: ""
   database:
     enabled: true
-    # Bundled in-cluster Postgres service name created by this chart. Verify against the
-    # chart's service template if the app cannot connect.
     host: "crossview-postgres"
     port: 5432
     database: crossview
@@ -217,13 +202,11 @@ config:
       key: ""
   server:
     port: 3001
-    # Short UI labels for long kube context names, shown as badges in the multi-cluster
-    # switcher. Keys MUST match the exact context names in your kubeconfig (see
-    # multi-cluster/build-kubeconfig.sh, which names contexts after --context-name).
+    # UI labels for the switcher. Keys MUST match the kubeconfig context names below.
     contextAliases:
-      hub: HUB
-      prod: PROD
-      staging: STAGING
+      cluster-1: C1
+      cluster-2: C2
+      cluster-3: C3
     auth:
       mode: session
       trustedHeader: X-Auth-User
@@ -232,8 +215,6 @@ config:
     log:
       level: info
     cors:
-      # Set to the public URL of this Crossview instance in production, otherwise
-      # post-login SSO redirects go to localhost.
       origin: http://localhost:5173
       credentials: true
     session:
@@ -255,8 +236,7 @@ config:
           target: http://localhost:3001
           changeOrigin: true
 
-# Secrets configuration
-# admin/db passwords come from ESO-managed Secret prod-crossview-secrets (never in Git).
+# Secrets configuration — admin/db passwords from ESO-managed Secret prod-crossview-secrets.
 secrets:
   adminUsername: "admin"
   adminPassword:
@@ -269,18 +249,14 @@ secrets:
       key: db-password
 
 # Service Account
-# In multi-cluster (kubeconfig) mode Crossview authenticates to each cluster with the
-# tokens embedded in the kubeconfig, NOT an in-cluster ServiceAccount token. We do not
-# create a SA or bind cluster RBAC; the default SA (token automount disabled above) only
-# schedules the pod.
+# The Crossview pod itself needs no AWS/cluster identity (it authenticates to every
+# cluster via the refreshed token files). Keep the default SA, token automount off.
 serviceAccount:
   create: false
   name: ""
   annotations: {}
 
-# RBAC
-# Not needed in kubeconfig mode — access on each target cluster is governed by the
-# read-only ClusterRole bound to the per-cluster crossview-viewer ServiceAccount.
+# RBAC — not needed for the Crossview pod (cluster access is via kubeconfig token files).
 rbac:
   create: false
   clusterRole:
@@ -319,12 +295,11 @@ autoscaling:
   minReplicas: 1
   maxReplicas: 10
 
-# Extra manifests: ESO ExternalSecrets that pull app secrets AND the multi-cluster
-# kubeconfig from AWS Secrets Manager. ESO authenticates to AWS via EKS Pod Identity
-# (the aws-cluster-secretstore ClusterSecretStore needs NO auth block when Pod Identity
-# is used). refreshInterval re-pulls the kubeconfig so rotated tokens propagate.
+# ============================================================================
+# extraManifests: everything the token-refresher model needs, delivered via the chart.
+# ============================================================================
 extraManifests:
-  # App credentials (admin + db passwords)
+  # ---- App credentials (admin + db passwords), pulled by ESO via Pod Identity ---------
   - |-
     apiVersion: external-secrets.io/v1
     kind: ExternalSecret
@@ -350,72 +325,196 @@ extraManifests:
           remoteRef:
             key: prod/devops/crossview
             property: db-password
-  # ===== PHASE 0 PROBE (TEMPORARY) =====================================================
-  # Self-contained 2-context kubeconfig for the gate test. Replaces the ESO-backed
-  # kubeconfig ExternalSecret so we are NOT dependent on the AWS secret
-  # prod/devops/kubeconfig (which does not exist yet — that was the "Secret does not
-  # exist" error). Two contexts: cluster-1 (real, in-cluster SA) and cluster-dummy (fake).
-  # We only check whether the UI lists BOTH. cluster-dummy will error if clicked — fine.
-  # NOTE: with automountServiceAccountToken:false the SA files won't exist, so cluster-1
-  # may not connect either — that does not affect the listing test.
+
+  # ---- Kubeconfig ConfigMap (endpoints + CA data only; NO secrets) --------------------
+  # Users reference tokenFile paths under /tokens, populated by the refresher.
+  # PLACEHOLDER: replace C1_ENDPOINT / C2_ENDPOINT / C3_ENDPOINT and the *_CA_B64 values
+  # with the real outputs from multi-cluster/collect-cluster-facts.sh.
   - |-
     apiVersion: v1
     kind: ConfigMap
     metadata:
-      name: crossview-kubeconfig-probe
+      name: crossview-kubeconfig
       namespace: crossview
     data:
       config: |
         apiVersion: v1
         kind: Config
         clusters:
-          - name: real
+          - name: cluster-1
             cluster:
-              server: https://kubernetes.default.svc
-              certificate-authority: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
-          - name: dummy
+              server: https://C1_ENDPOINT
+              certificate-authority-data: C1_CA_B64
+          - name: cluster-2
             cluster:
-              server: https://example.invalid
-              insecure-skip-tls-verify: true
+              server: https://C2_ENDPOINT
+              certificate-authority-data: C2_CA_B64
+          - name: cluster-3
+            cluster:
+              server: https://C3_ENDPOINT
+              certificate-authority-data: C3_CA_B64
         users:
-          - name: real
+          - name: u1
             user:
-              tokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
-          - name: dummy
+              tokenFile: /tokens/c1
+          - name: u2
             user:
-              token: dummy
+              tokenFile: /tokens/c2
+          - name: u3
+            user:
+              tokenFile: /tokens/c3
         contexts:
           - name: cluster-1
             context:
-              cluster: real
-              user: real
-          - name: cluster-dummy
+              cluster: cluster-1
+              user: u1
+          - name: cluster-2
             context:
-              cluster: dummy
-              user: dummy
+              cluster: cluster-2
+              user: u2
+          - name: cluster-3
+            context:
+              cluster: cluster-3
+              user: u3
         current-context: cluster-1
-  # ----- ORIGINAL ESO kubeconfig ExternalSecret — restore after the probe ---------------
-  # Stored in Secrets Manager under prod/devops/kubeconfig as JSON with a `kubeconfig`
-  # key. If you store the RAW file instead, drop the `property: kubeconfig` line.
-  # - |-
-  #   apiVersion: external-secrets.io/v1
-  #   kind: ExternalSecret
-  #   metadata:
-  #     name: prod-crossview-kubeconfig
-  #     namespace: crossview
-  #     annotations:
-  #       argocd.argoproj.io/sync-wave: "-1"
-  #   spec:
-  #     refreshInterval: "15m"
-  #     secretStoreRef:
-  #       name: aws-cluster-secretstore
-  #       kind: ClusterSecretStore
-  #     target:
-  #       name: prod-crossview-kubeconfig
-  #       creationPolicy: Owner
-  #     data:
-  #       - secretKey: config
-  #         remoteRef:
-  #           key: prod/devops/kubeconfig
-  #           property: kubeconfig
-  # ===== END PHASE 0 PROBE =============================================================
+
+  # ---- Token-refresher: ServiceAccount (gets the EKS Pod Identity association) --------
+  - |-
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: crossview-token-refresher
+      namespace: crossview
+
+  # ---- Token Secret the refresher writes and Crossview mounts -------------------------
+  # Argo-safe: the refresher patches this every ~10 min, so tell Argo CD to ignore its
+  # data (otherwise the app shows perpetually OutOfSync and may revert the tokens).
+  - |-
+    apiVersion: v1
+    kind: Secret
+    metadata:
+      name: crossview-remote-tokens
+      namespace: crossview
+      annotations:
+        argocd.argoproj.io/compare-options: IgnoreExtraneous
+        argocd.argoproj.io/sync-options: Prune=false
+    type: Opaque
+
+  # ---- RBAC: allow the refresher to patch ONLY that one Secret ------------------------
+  - |-
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: Role
+    metadata:
+      name: crossview-token-writer
+      namespace: crossview
+    rules:
+      - apiGroups: [""]
+        resources: ["secrets"]
+        verbs: ["get", "update", "patch"]
+        resourceNames: ["crossview-remote-tokens"]
+  - |-
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: crossview-token-writer
+      namespace: crossview
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: Role
+      name: crossview-token-writer
+    subjects:
+      - kind: ServiceAccount
+        name: crossview-token-refresher
+        namespace: crossview
+
+  # ---- Token-refresher Deployment -----------------------------------------------------
+  # Uses amazon/aws-cli (has aws + a shell + curl). Mints a token per cluster and PATCHes
+  # the Secret via the local Kubernetes REST API with its OWN SA token — no kubectl.
+  # PLACEHOLDER: set CLUSTER_1 / CLUSTER_2 / CLUSTER_3 to the real EKS cluster names.
+  - |-
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: crossview-token-refresher
+      namespace: crossview
+      labels:
+        app: crossview-token-refresher
+    spec:
+      replicas: 1
+      selector:
+        matchLabels:
+          app: crossview-token-refresher
+      template:
+        metadata:
+          labels:
+            app: crossview-token-refresher
+        spec:
+          serviceAccountName: crossview-token-refresher
+          containers:
+            - name: refresher
+              image: amazon/aws-cli:2.15.30
+              command: ["/bin/sh", "-c"]
+              env:
+                - name: AWS_REGION
+                  value: us-east-1
+                - name: NS
+                  value: crossview
+                - name: SECRET
+                  value: crossview-remote-tokens
+                # AWS CLI needs writable HOME/TMP; root fs is read-only so redirect to emptyDirs.
+                - name: HOME
+                  value: /tmp
+                - name: AWS_CONFIG_FILE
+                  value: /tmp/aws-config
+                - name: AWS_SHARED_CREDENTIALS_FILE
+                  value: /tmp/aws-credentials
+                - name: TMPDIR
+                  value: /tmp
+              args:
+                - |
+                  set -eu
+                  API=https://kubernetes.default.svc
+                  SATOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+                  CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+                  b64() { printf '%s' "$1" | base64 | tr -d '\n'; }
+                  patch_secret() {
+                    # $1=c1 token, $2=c2 token, $3=c3 token
+                    BODY="{\"data\":{\"c1\":\"$(b64 "$1")\",\"c2\":\"$(b64 "$2")\",\"c3\":\"$(b64 "$3")\"}}"
+                    curl -sS --cacert "$CACERT" \
+                      -H "Authorization: Bearer $SATOKEN" \
+                      -H "Content-Type: application/strategic-merge-patch+json" \
+                      -X PATCH \
+                      "$API/api/v1/namespaces/$NS/secrets/$SECRET" \
+                      -d "$BODY" >/dev/null
+                  }
+                  while true; do
+                    T1=$(aws eks get-token --cluster-name CLUSTER_1 --region "$AWS_REGION" | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+                    T2=$(aws eks get-token --cluster-name CLUSTER_2 --region "$AWS_REGION" | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+                    T3=$(aws eks get-token --cluster-name CLUSTER_3 --region "$AWS_REGION" | sed -n 's/.*"token": *"\([^"]*\)".*/\1/p')
+                    if [ -n "$T1" ] && [ -n "$T2" ] && [ -n "$T3" ]; then
+                      patch_secret "$T1" "$T2" "$T3" && echo "$(date -u) refreshed tokens"
+                    else
+                      echo "$(date -u) WARN: empty token (c1=${#T1} c2=${#T2} c3=${#T3})" >&2
+                    fi
+                    sleep 600
+                  done
+              resources:
+                requests:
+                  cpu: 25m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                runAsNonRoot: true
+                runAsUser: 1000
+                capabilities:
+                  drop: ["ALL"]
+          volumes:
+            - name: tmp
+              emptyDir: {}
